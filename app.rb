@@ -22,7 +22,7 @@ class Freshcerts::App < Sinatra::Base
   
   def san
     unless s = params[:san]
-      []
+      return []
     end
     raise DomainError if s.include?(' ')
     @san = s.strip.split(',').map{|p| DomainName(p).hostname}
