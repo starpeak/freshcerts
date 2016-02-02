@@ -19,6 +19,14 @@ class Freshcerts::App < Sinatra::Base
     raise DomainError if d.nil? || d.include?(' ')
     @domain ||= DomainName(d).hostname
   end
+  
+  def san
+    unless s = params[:san]
+      []
+    end
+    raise DomainError if s.include?(' ')
+    @san = s.strip.split(',').map{|p| DomainName(p).hostname}
+  end
 
   def issue_error!(msg)
     Freshcerts.notify_admin 'certificate issue error', "Error message:\n#{msg}\n\nRequest:\n#{request.to_yaml}"
@@ -66,23 +74,25 @@ class Freshcerts::App < Sinatra::Base
     csr = OpenSSL::X509::Request.new params[:csr][:tempfile].read
     ports = (params[:ports] || '443').split(',').map { |port| port.strip.to_i }
 
-    authorization = Freshcerts.acme.authorize :domain => domain
-    challenge = authorization.http01
-    challenge_id = challenge.filename.sub /.*challenge\/?/, ''
-    $challenges[challenge_id] = challenge.file_content
-    logger.info "challenge domain=#{domain} id=#{challenge_id}"
-    sleep 0.1
-    challenge.request_verification
-    status = nil
-    while (status = challenge.verify_status) == 'pending'
-      sleep 0.5
-    end
-    logger.info "challenge domain=#{domain} id=#{challenge_id} status=#{status}"
-    unless status == 'valid'
+    ([domain]+san).each do |domain|
+      authorization = Freshcerts.acme.authorize :domain => domain
+      challenge = authorization.http01
+      challenge_id = challenge.filename.sub /.*challenge\/?/, ''
+      $challenges[challenge_id] = challenge.file_content
+      logger.info "challenge domain=#{domain} id=#{challenge_id}"
+      sleep 0.1
+      challenge.request_verification
+      status = nil
+      while (status = challenge.verify_status) == 'pending'
+        sleep 0.5
+      end
+      logger.info "challenge domain=#{domain} id=#{challenge_id} status=#{status}"
+      unless status == 'valid'
+        $challenges.delete challenge_id
+        issue_error! "CA returned challenge validation status: #{status}.\n\nChallenge:\n#{challenge.to_yaml}"
+      end
       $challenges.delete challenge_id
-      issue_error! "CA returned challenge validation status: #{status}.\n\nChallenge:\n#{challenge.to_yaml}"
     end
-    $challenges.delete challenge_id
 
     certificate = Freshcerts.acme.new_certificate csr
     cert_hash = Freshcerts.hash_cert certificate
