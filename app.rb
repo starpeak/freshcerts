@@ -45,7 +45,7 @@ class Freshcerts::App < Sinatra::Base
     issue_error! 'A valid authentication token was not provided.'
   end
 
-  error Acme::Error::Malformed do
+  error Acme::Client::Error::Malformed do
     issue_error! "Domain '#{domain}' is not supported by the CA."
   end
 
@@ -71,32 +71,62 @@ class Freshcerts::App < Sinatra::Base
 
   post '/v1/cert/:domain/issue' do
     Freshcerts.tokens.check! params[:token]
+    ([domain]+san).each do |domain|
+      challenge = make_challenge domain
+      verify_challenge domain, challenge 
+    end
+    issue
+  end
+
+  post '/v1/cert/:domain/issue-multistep/challenge' do
+    Freshcerts.tokens.check! params[:token]
+    
+    challenge = make_challenge domain
+    data = challenge.to_h
+    data[:file_content] = challenge.file_content
+    data[:filename] = challenge.filename
+    content_type :json
+    data.to_json
+  end
+
+  post '/v1/cert/:domain/issue-multistep/issue' do
+    Freshcerts.tokens.check! params[:token]
+    challenge = Freshcerts.acme.challenge_from_hash JSON.parse params[:challenge][:tempfile].read
+    verify_challenge domain, challenge
+    issue
+  end
+
+  def make_challenge domain
+    authorization = Freshcerts.acme.authorize :domain => domain
+    challenge = authorization.http01
+    challenge_id = challenge.filename.sub /.*challenge\/?/, ''
+    $challenges[challenge_id] = challenge.file_content
+    logger.info "make_challenge domain=#{domain} id=#{challenge_id}"
+    challenge
+  end
+
+  def verify_challenge(domain, challenge)
+    sleep 0.1
+    challenge.request_verification
+    status = nil
+    while (status = challenge.verify_status) == 'pending'
+      sleep 0.5
+    end
+    challenge_id = challenge.filename.sub /.*challenge\/?/, ''
+    logger.info "verify_challenge domain=#{domain} id=#{challenge_id} status=#{status}"
+    unless status == 'valid'
+      $challenges.delete challenge_id
+      issue_error! "CA returned challenge validation status: #{status}.\n\nChallenge:\n#{challenge.to_yaml}"
+    end
+    $challenges.delete challenge_id
+  end
+
+  def issue
     csr = OpenSSL::X509::Request.new params[:csr][:tempfile].read
     ports = (params[:ports] || '443').split(',').map { |port| port.strip.to_i }
-
-    ([domain]+san).each do |domain|
-      authorization = Freshcerts.acme.authorize :domain => domain
-      challenge = authorization.http01
-      challenge_id = challenge.filename.sub /.*challenge\/?/, ''
-      $challenges[challenge_id] = challenge.file_content
-      logger.info "challenge domain=#{domain} id=#{challenge_id}"
-      sleep 0.1
-      challenge.request_verification
-      status = nil
-      while (status = challenge.verify_status) == 'pending'
-        sleep 0.5
-      end
-      logger.info "challenge domain=#{domain} id=#{challenge_id} status=#{status}"
-      unless status == 'valid'
-        $challenges.delete challenge_id
-        issue_error! "CA returned challenge validation status: #{status}.\n\nChallenge:\n#{challenge.to_yaml}"
-      end
-      $challenges.delete challenge_id
-    end
-
     certificate = Freshcerts.acme.new_certificate csr
     cert_hash = Freshcerts.hash_cert certificate
-    logger.info "certificate domain=#{domain} subject=#{certificate.x509.subject.to_s} sha256=#{cert_hash} expires=#{certificate.x509.not_after.to_s}"
+    logger.info "issue domain=#{domain} subject=#{certificate.x509.subject.to_s} sha256=#{cert_hash} expires=#{certificate.x509.not_after.to_s}"
     Freshcerts.sites[domain] = Freshcerts::Site.new ports, :fresh, Time.now, cert_hash, certificate.x509.not_after
     content_type 'application/x-tar'
     stream do |out|
